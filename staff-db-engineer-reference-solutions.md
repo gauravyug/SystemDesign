@@ -6,6 +6,7 @@ Each variant below follows the same structure: Functional Requirements → Non-F
 ---
 
 # Variant A — Flash-sale e-commerce
+Design the database layer for a high-traffic e-commerce flash-sale platform (e.g. a limited-inventory sneaker drop) that needs to handle a sudden 50x traffic spike
 
 ## 1. Functional Requirements
 - Browse items with real-time stock count
@@ -81,6 +82,7 @@ Client → Edge (CDN, rate limit, virtual queue) → App/order service (stateles
 ---
 
 # Variant B — Concert/movie ticket booking
+Design the database layer for a ticket booking platform where tickets for a single stadium concert (60,000 seats) go on sale simultaneously to 3 million waiting users
 
 ## 1. Functional Requirements
 - Display seat map with real-time availability
@@ -148,6 +150,7 @@ Client → Edge (rate limit, virtual queue) → App/booking service
 ---
 
 # Variant C — Ride-hailing surge/driver matching
+Design the database layer for a ride-hailing platform during a surge event (e.g. New Year's Eve) where driver supply in a dense city area is far outstripped by rider demand.
 
 ## 1. Functional Requirements
 - Rider requests a ride; system matches to nearest available driver
@@ -216,6 +219,7 @@ Rider/Driver apps → Edge (regional routing by geo)
 ---
 
 # Variant D — Flash discount / food delivery surge
+Design the database layer for a food delivery app running a 1-hour flash discount (70% off) that causes a 40x spike in order volume across a small set of highly popular restaurants
 
 ## 1. Functional Requirements
 - Display discounted restaurants + real-time remaining order-capacity
@@ -280,6 +284,7 @@ Client → Edge (rate limit, queue) → App/order service
 ---
 
 # Variant E — Banking/payments ledger burst (hardest variant)
+Design the database layer for a digital bank's fund-transfer system during a government subsidy disbursement event, where 10 million accounts receive a credit simultaneously and a large fraction of recipients attempt to withdraw/transfer within the same hour."
 
 ## 1. Functional Requirements
 - Credit 10M accounts simultaneously (batch disbursement)
