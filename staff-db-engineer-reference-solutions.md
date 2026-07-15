@@ -22,6 +22,17 @@ Design the database layer for a high-traffic e-commerce flash-sale platform (e.g
 - RPO near-zero, RTO ~2 min
 - Fairness / anti-bot protection
 
+2a. Data-Driven Capacity Planning (worked example)
+
+This is the step most candidates skip — going straight from "250K TPS" to "shard the database" without ever separating attempted load from actual write load. Worked through:
+
+
+Attempted vs. successful writes are wildly different numbers. 250K TPS is the attempt rate (everyone mashing "buy"). If the 500 hot items hold ~1,000 units each (500K total units), and the sale drains in ~10 min, the actual successful write rate is only 500,000 ÷ 600s ≈ 833 writes/sec. The other 249,167 requests/sec are rejections. This reframes the entire problem: the DB doesn't need to sustain 250K writes/sec — it needs Redis (or equivalent) to reject 99.7% of traffic in microseconds so only ~833/sec of real writes ever reach Postgres.
+Concurrency via Little's Law: with a 50ms average reject-path latency at 250K req/sec attempted, concurrent in-flight requests ≈ 250,000 × 0.05 = 12,500 concurrent connections at any instant. This is why the edge/app tier must be async/non-blocking (e.g. event-loop based, not thread-per-request) — 12,500 blocked threads would exhaust most app server pools.
+Storage sizing: 10M SKUs at ~200 bytes/row ≈ 2GB for the item catalog — trivial. ~500K orders/sale at ~500 bytes/row ≈ 250MB per sale event — also trivial. The DB storage footprint is a non-issue here; the bottleneck is entirely request-handling throughput, not data volume.
+Redis memory: 500 hot-item counters (negligible) plus per-user rate-limit keys for up to a few million concurrent users at ~200 bytes each ≈ under 1GB. Cheap to run even at peak.
+Key insight to listen for: a strong candidate explicitly says "most of my capacity planning effort goes into the reject-fast path, not the database write path, because the real write volume is orders of magnitude smaller than the request volume." A candidate who sizes Postgres for 250K writes/sec is solving the wrong problem.
+
 ## 3. Core Entities
 | Entity | Key fields |
 |---|---|
@@ -94,7 +105,15 @@ Design the database layer for a ticket booking platform where tickets for a sing
 - Strong consistency per-seat (not per-item-counter — this is the key difference from Variant A)
 - RPO near-zero, RTO ~2 min
 - No seat double-booked even under retries/duplicate requests
+- 
+2a. Data-Driven Capacity Planning (worked example)
 
+
+Attempt rate vs. success rate: 3M users hit "buy" within 30 seconds ≈ 100,000 attempted holds/sec, but only 60,000 seats exist total — success rate is under 2%. As in Variant A, the write-path bottleneck is small (60,000 successful holds spread over the rush, easily well under 5,000 writes/sec even in a worst-case instant burst); the dominant problem is rejecting the other 98% fast.
+The read fan-out is the real number to size for: if all 3M clients poll the seat map every 2 seconds while waiting, that's 1.5M reads/sec — two orders of magnitude bigger than the write problem. This is the single most important calculation in this variant, and the reason polling should be rejected in favor of push-based updates.
+Connections at the edge, not the DB: if seat-map updates are pushed via WebSocket instead of polled, the app/edge tier needs to hold 3M concurrent persistent connections — a connection-handling capacity question (load balancer + app tier), entirely decoupled from Postgres's max_connections limit (which caps in the low thousands and would never be exposed to 3M raw clients regardless of architecture).
+Storage: 60,000 seat rows — trivial. The read fan-out, not data volume, drives every scaling decision here.
+Key insight to listen for: candidates should recognize that Variant A and B look similar (bursty flash-event, limited inventory) but the actual bottleneck is different — write contention in A, read fan-out in B. A candidate who proposes the identical architecture for both without noticing this is pattern-matching rather than doing the workload analysis.
 ## 3. Core Entities
 | Entity | Key fields |
 |---|---|
@@ -162,6 +181,15 @@ Design the database layer for a ride-hailing platform during a surge event (e.g.
 - Multi-region: drivers/riders geo-partitioned, platform globally distributed
 - Low-latency matching (p99 < 500ms for match decision)
 - RTO/RPO similar to other variants; ride-state loss is a real financial/dispute risk
+
+- 2a. Data-Driven Capacity Planning (worked example)
+
+
+Two separate write streams, sized separately: 500,000 ride requests/min ≈ 8,333 requests/sec for matching (strongly consistent path). Driver location pings — 20,000 drivers, each pinging every ~4 sec — ≈ 5,000 writes/sec (eventually consistent path). These are comparable in raw magnitude but need entirely different storage engines/consistency guarantees, which is the point of this variant.
+Match latency budget via Little's Law: with a p99 500ms match-decision target at 8,333 req/sec, concurrent in-flight match operations ≈ 8,333 × 0.5 = ~4,167 concurrent matching workflows — sizes the matching service's worker pool / thread budget directly.
+Driver-to-demand ratio: 8,333 requests/sec against only 20,000 total drivers means, at any instant, most requests in a dense surge zone simply cannot be matched — the system needs to handle queueing/backpressure (put riders in a wait queue with an ETA) rather than assuming every request resolves to an immediate match. This changes the design from "matching service" to "matching + queueing service."
+Storage: driver location updates at 5,000 writes/sec, if retained even briefly for ETA calculation, is ~5,000 × 3600 = 18M rows/hour if stored naively — this is why location data should live in an in-memory geo-index (Redis/H3-based) with only the current position retained, not an append-only log, unless historical trip-replay is a separate explicit requirement.
+Key insight to listen for: candidates should compute the driver-to-demand ratio and conclude that the real design problem during a surge isn't "how fast can we write ride requests" but "how do we gracefully queue/price demand that structurally cannot be matched immediately" — this is what surge pricing is actually for, a demand-shaping mechanism, not just a UI feature.
 
 ## 3. Core Entities
 | Entity | Key fields |
