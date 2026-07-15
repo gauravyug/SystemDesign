@@ -22,28 +22,28 @@ Design the database layer for a high-traffic e-commerce flash-sale platform (e.g
 - RPO near-zero, RTO ~2 min
 - Fairness / anti-bot protection
 
-2a. Data-Driven Capacity Planning (worked example)
+## 2a. Data-Driven Capacity Planning (worked example)
 
-Example assumptions
-
-
-Registered users: 50M
-Concurrent users during sale: 5M
-Peak checkout (write-attempt) requests: 500K/sec
-Inventory: 100K sneaker pairs (across the hot SKUs on sale)
-Successful orders: 100K (sells out completely — every unit moves)
-Reads greatly exceed writes
+### Example assumptions
 
 
-Derived calculations
+- Registered users: 50M
+- Concurrent users during sale: 5M
+- Peak checkout (write-attempt) requests: 500K/sec
+- Inventory: 100K sneaker pairs (across the hot SKUs on sale)
+- Successful orders: 100K (sells out completely — every unit moves)
+- Reads greatly exceed writes
 
 
-Success rate: only 100,000 units exist, so no matter how the 500K req/sec peak is sustained, at most 100,000 checkout attempts can ever succeed. If the peak window lasts even 10 seconds, that's 5,000,000 attempts competing for 100,000 units — a 2% success rate. This is the number that should drive the architecture: the system is overwhelmingly in the business of rejecting requests correctly and fast, not writing them.
-Actual DB write rate: if the full 100K inventory drains over, say, a 2-minute window as demand tapers, actual successful writes ≈ 100,000 ÷ 120s ≈ 833 writes/sec — three orders of magnitude below the 500K/sec attempt rate. Postgres needs to comfortably sustain ~833 writes/sec, not 500K.
-Read volume from concurrency: 5M concurrent users, each polling stock/product state roughly every 2 seconds → 5,000,000 ÷ 2 ≈ 2.5M reads/sec just from passive polling, on top of the 500K/sec active checkout attempts. This is the "reads greatly exceed writes" assumption made concrete: reads (2.5M/sec) outnumber actual writes (833/sec) by roughly 3,000:1. That ratio is the single strongest argument for a heavy caching/CDN layer in front of Postgres for all read traffic, with the database reserved almost entirely for the low-volume write path.
-Concurrency via Little's Law (checkout path): at 500K attempted req/sec with a ~30ms average reject-path latency, concurrent in-flight requests ≈ 500,000 × 0.03 = 15,000 concurrent connections at any instant on the checkout path alone — this sizes the async/event-loop capacity needed at the edge/app tier (thread-per-request would collapse here).
-Storage sizing: 50M user records at ~1KB/row ≈ 50GB (the largest table by far, but a platform-wide number, not sale-specific). 100K SKU rows: trivial (~20MB). 100K order rows at ~500 bytes: ~50MB. The sale itself contributes almost nothing to storage growth — user data dominates, and it grows independent of any single flash sale.
-Redis memory: 5M concurrent-user rate-limit/session keys at ~200 bytes each ≈ ~1GB. Trivial to provision, but worth stating explicitly rather than hand-waving "we'll use Redis."
+- Derived calculations
+
+
+- Success rate: only 100,000 units exist, so no matter how the 500K req/sec peak is sustained, at most 100,000 checkout attempts can ever succeed. If the peak window lasts even 10 seconds, that's 5,000,000 attempts competing for 100,000 units — a 2% success rate. This is the number that should drive the architecture: the system is overwhelmingly in the business of rejecting requests correctly and fast, not writing them.
+- Actual DB write rate: if the full 100K inventory drains over, say, a 2-minute window as demand tapers, actual successful writes ≈ 100,000 ÷ 120s ≈ 833 writes/sec — three orders of magnitude below the 500K/sec attempt rate. Postgres needs to comfortably sustain ~833 writes/sec, not 500K.
+- Read volume from concurrency: 5M concurrent users, each polling stock/product state roughly every 2 seconds → 5,000,000 ÷ 2 ≈ 2.5M reads/sec just from passive polling, on top of the 500K/sec active checkout attempts. This is the "reads greatly exceed writes" assumption made concrete: reads (2.5M/sec) outnumber actual writes (833/sec) by roughly 3,000:1. That ratio is the single strongest argument for a heavy caching/CDN layer in front of Postgres for all read traffic, with the database reserved almost entirely for the low-volume write path.
+- Concurrency via Little's Law (checkout path): at 500K attempted req/sec with a ~30ms average reject-path latency, concurrent in-flight requests ≈ 500,000 × 0.03 = 15,000 concurrent connections at any instant on the checkout path alone — this sizes the async/event-loop capacity needed at the edge/app tier (thread-per-request would collapse here).
+- Storage sizing: 50M user records at ~1KB/row ≈ 50GB (the largest table by far, but a platform-wide number, not sale-specific). 100K SKU rows: trivial (~20MB). 100K order rows at ~500 bytes: ~50MB. The sale itself contributes almost nothing to storage growth — user data dominates, and it grows independent of any single flash sale.
+- Redis memory: 5M concurrent-user rate-limit/session keys at ~200 bytes each ≈ ~1GB. Trivial to provision, but worth stating explicitly rather than hand-waving "we'll use Redis."
 Key insight to listen for: a strong candidate should explicitly derive the 2% success rate and the 3,000:1 read:write ratio from the given assumptions, and state that these two numbers — not the headline 500K/sec figure — are what actually drive the architecture: reject-fast at the edge, heavy read caching, and a database sized for ~1K writes/sec rather than 500K..
 
 ## 3. Core Entities
