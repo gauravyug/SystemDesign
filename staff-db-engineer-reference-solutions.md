@@ -1,7 +1,4 @@
-# Reference Design Solutions — Staff Database Engineer 2
-### Full solutions for all 5 interview variants — use as your grading reference, not to hand to candidates
 
-Each variant below follows the same structure: Functional Requirements → Non-Functional Requirements → Core Entities → APIs → High-Level Design → Detailed HLD & Deep Dive. Use these to calibrate what a strong staff-level answer looks like; candidates aren't expected to hit every point, but should demonstrate the reasoning patterns.
 
 ---
 
