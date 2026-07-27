@@ -376,3 +376,117 @@ When a dispatcher gets a "token invalid" response from a provider, it doesn't ju
 - When asked to "dig deeper," go to **failure modes and data model tradeoffs first** — that's consistently where Staff-level signal is differentiated from a correct-but-shallow design.
 - Volunteer the **downstream blast-radius point** (pre-warming the CDN/catalog service before a mass push) without being asked — it shows systems thinking beyond the component you were literally asked to design.
 - If time allows, close by naming what you'd cut under a tighter timeline (e.g., "the segment sub-bucketing is the first thing I'd defer if this were a smaller scale") — shows you understand these are engineering tradeoffs, not requirements handed down from nowhere.
+
+
+
+# Netflix System Design — Mock Interview Question Bank
+
+*Streaming-platform-flavored system design prompts, organized by theme, each with probing follow-ups on tech-choice rationale, data model, and failure scenarios.*
+
+---
+
+## A. Content Delivery & Playback
+
+**1. Design a global recommendation engine**
+- Probe: batch vs. real-time scoring — how do you split offline model training from online serving?
+- Probe: what's your feature store's consistency model, and what breaks if it's stale by 5 minutes vs. 5 hours?
+- Probe: cold-start for new users/titles — walk through the fallback path.
+- Probe: a region goes down mid-serving — what does a degraded-but-functional response look like?
+
+**2. Design the video streaming architecture (encode → CDN → playback)**
+- Probe: why adaptive bitrate streaming, and how do you choose chunk/segment duration?
+- Probe: Open Connect (owned CDN) vs. third-party CDN — tradeoff and fallback trigger?
+- Probe: manifest/metadata service degrades during a global launch — mitigation?
+
+**3. Design a distributed video transcoding / encoding pipeline**
+- Probe: how do you parallelize encoding a single 2-hour film across many bitrates/codecs without one slow shard blocking release?
+- Probe: how do you avoid re-encoding the same source unnecessarily (dedup/caching of intermediate artifacts)?
+- Probe: a transcoding worker fleet fails mid-job for a title launching in 2 hours — what's the recovery path?
+
+**4. Design a live sports/live-event streaming system**
+- Probe: how does this differ architecturally from on-demand VOD streaming (no pre-encoded segments waiting)?
+- Probe: how do you handle millions of concurrent viewers joining within the same 60-second window (kickoff)?
+- Probe: what's your strategy for minimizing glass-to-glass latency vs. buffering for smooth playback?
+
+**5. Design a real-time video Quality-of-Experience (QoE) monitoring system**
+- Probe: what signals do you collect client-side (rebuffer events, bitrate switches, startup time), and how do you aggregate them without overwhelming ingestion at scale?
+- Probe: how do you distinguish a client-side network issue from a CDN-wide degradation in near-real-time?
+
+**6. Design a subtitle/audio-track delivery and sync system**
+- Probe: how do you keep subtitle timing in sync across variable-bitrate segments and mid-stream quality switches?
+- Probe: how would you support 30+ languages per title without bloating manifest size or startup latency?
+
+---
+
+## B. Data, Search & Personalization
+
+**7. Design the content catalog / metadata service**
+- Probe: how is catalog data partitioned across 190+ countries with different licensing windows?
+- Probe: a licensing change needs to propagate globally within minutes — how do you avoid stale reads at the edge?
+
+**8. Design a search & autocomplete system for titles, actors, and genres**
+- Probe: how do you rank results when "Stranger Things" should out-rank a niche title with a similar name?
+- Probe: how do you handle typo tolerance and multi-language search without a huge latency penalty?
+
+**9. Design a "Continue Watching" / cross-device playback-position sync system**
+- Probe: user pauses on their phone and resumes on their TV seconds later — what's your consistency model for the resume position?
+- Probe: two devices report conflicting positions (offline download watched, then synced) — how do you resolve it?
+
+**10. Design a trending/"Top 10" titles system per region**
+- Probe: how do you compute this in near-real-time at regional granularity without recomputing from scratch across all viewing events?
+- Probe: how do you prevent a short-lived viral spike from distorting the ranking unfairly (or is that desired)?
+
+---
+
+## C. Platform Infrastructure
+
+**11. Design a rate limiter / API gateway for the edge**
+- Probe: token bucket vs. sliding window — justify given Netflix's bursty traffic (e.g., new-season drops).
+- Probe: local per-node counters vs. a shared distributed store — what's the consistency cost either way?
+
+**12. Design a chaos engineering platform (Chaos Monkey-style)**
+- Probe: how do you scope blast radius so an injected failure can't cascade into a real outage?
+- Probe: how would you validate the platform itself doesn't become a single point of failure?
+
+**13. Design a global multi-region failover system**
+- Probe: active-active vs. active-passive — justify given latency and cost constraints.
+- Probe: how do you detect a "gray failure" (partially degraded region) and decide to fail over?
+
+**14. Design a global feature-flag / config rollout system**
+- Probe: how do you roll out a risky change to 1% of traffic and safely halt it if error rates spike?
+- Probe: how do flags stay consistent for a single user across multiple services in one request (avoiding a user seeing half old, half new behavior)?
+
+**15. Design a push notification system for hundreds of millions of devices** *(already covered in depth — see separate doc)*
+
+---
+
+## D. Account, Trust & Monetization
+
+**16. Design a subscription billing and payment-retry system**
+- Probe: a payment fails — how do you decide retry timing/count before suspending access, balancing churn risk against fraud risk?
+- Probe: how do you handle a payment provider outage without incorrectly suspending millions of paying accounts?
+
+**17. Design an account-sharing / concurrent-stream detection system**
+- Probe: how do you distinguish a household with multiple devices from genuine cross-household sharing, using signals like IP, device fingerprint, and location — without being overly invasive or generating false positives?
+- Probe: what's the data model for tracking concurrent stream counts per account at scale, and how do you enforce a limit in near-real-time without a synchronous global lock?
+
+**18. Design a ratings/reviews aggregation system**
+- Probe: how do you compute an aggregate score that updates in near-real-time as millions of ratings stream in, without recomputing the full aggregate on every write?
+- Probe: how do you detect and mitigate rating manipulation (bot/brigading) at scale?
+
+**19. Design a parental controls / multi-profile management system**
+- Probe: how do content restrictions propagate consistently across a profile's active sessions on multiple devices in real time?
+- Probe: what's the data model for per-profile viewing history and restrictions, given one account can have several profiles with very different access levels?
+
+**20. Design a real-time viewing-activity analytics pipeline** *(already covered — see original list)*
+- Probe: exactly-once vs. at-least-once delivery — why might this differ between "resume where you left off" and royalty/billing calculations?
+- Probe: how do you handle a stream-processing partition falling behind during a live-event spike?
+
+---
+
+## How to Use This Bank
+
+- Pick one question per mock session and time-box it to ~45 minutes, the way a real onsite round would run.
+- Force yourself to state **capacity estimates** and a **rough data model** before drawing the high-level diagram — that ordering is itself part of the signal an interviewer is grading.
+- After you land on an initial design, deliberately ask yourself the two hardest follow-ups from the probe list — most candidates get an adequate design; the differentiation at Staff level shows up in how you handle the probes, not the first draft.
+- Categories **C (Platform Infrastructure)** and **A (Content Delivery)** are the most likely core rounds for a Netflix system design interview; **D (Account/Trust)** questions are a good stretch set if you want practice with less "textbook" prompts that don't map cleanly onto a known paper or blog post.
