@@ -1,0 +1,378 @@
+# System Design: Push Notification System for a Streaming Platform (Hundreds of Millions of Devices)
+
+*Prepared as Netflix-style system design interview prep*
+
+---
+
+## 0. Problem Scoping
+
+**Stated problem:** Design a push notification system for hundreds of millions of devices, for a video streaming platform.
+
+Scoping it to a streaming platform (rather than a generic notification system) matters because it fixes three things that would otherwise be open-ended:
+
+- **Notification categories are known and finite**: new episode/season live, personalized recommendation, download-ready, resume-watching nudge, billing/account, live event (sports) starting soon.
+- **Traffic is bursty but often *predictable*** — season drops and live events happen at scheduled times, which changes the engineering problem from "absorb an unknown spike" to "prepare for a known spike."
+- **Personalization is core, not optional** — even a "broadcast-looking" event like a season drop is usually per-user targeted (respecting opt-in, locale, artwork variant), which rules out simply using a platform-level broadcast topic for everything.
+
+State this scoping assumption out loud in an interview before diving into the design — it signals you think about scope before architecture.
+
+---
+
+## 1. Requirements
+
+### 1.1 Functional Requirements
+- Trigger notifications from internal events: content-catalog (new release), recommendation engine (personalized suggestion), download manager (download-ready), billing (payment failed/renewed), live-sports scheduler (event starting soon).
+- Support three targeting modes:
+  - **Single-user / transactional** (download-ready, billing) — one device or account.
+  - **Segment** (e.g., "opted into new-release pings, region=US, plan=premium").
+  - **Broadcast** (rare — platform-wide outage notice).
+- Respect **user preferences**: per-category opt-in/opt-out, quiet hours (in the user's local timezone), locale/language.
+- Support multiple delivery channels: iOS (APNs), Android (FCM), Smart TV / web (Web Push / platform-specific push services), with graceful channel fallback (e.g., push fails → in-app inbox message shown on next open).
+- Track full delivery lifecycle: **queued → sent → delivered → opened/dismissed**, for both product analytics and campaign tuning.
+- Support scheduling and campaign management: a campaign has a target segment, a template, a scheduled time or window, and a status (draft/scheduled/sending/completed/failed).
+- Deduplicate: a user should not receive the same logical notification twice across retries.
+
+### 1.2 Non-Functional Requirements
+- **Scale**: ~300M subscriber accounts, ~500M registered devices (users average >1 device).
+- **Latency**:
+  - Transactional (download-ready, live-event-starting): p99 under a few seconds end-to-end.
+  - Broadcast/segment campaigns: best-effort, complete within a defined delivery window (e.g., 15–30 minutes), not necessarily instant.
+- **Throughput**: must absorb bursts of 60,000–70,000+ notifications/sec during major releases without violating provider rate limits or degrading the transactional path.
+- **Reliability**: at-least-once delivery semantics with idempotent dispatch; automatic retry with backoff; dead-letter handling for permanently invalid tokens.
+- **Availability**: the failure or throttling of one push provider (e.g., APNs down) must not degrade delivery to other platforms (Android, web) — no shared fate.
+- **Data freshness vs. cost tradeoff**: preference changes should propagate to the fan-out path within seconds to low-minutes; this does not need to be strongly consistent.
+- **Compliance**: opt-out must be honored across all in-flight and future sends; support regional data residency and right-to-be-forgotten style deletion of device/preference records.
+- **Observability**: near-real-time visibility into delivery funnel (sent/delivered/opened) and per-provider error rates, to detect a bad campaign or provider outage within minutes, not after the fact.
+
+### 1.3 Explicitly Out of Scope (say this out loud too)
+- In-app inbox / notification center UI rendering (assume it's a downstream consumer of the same delivery log).
+- Ad-hoc/rich two-way messaging (chat) — this is one-directional, platform-to-device.
+- SMS/email channels — mentioned as a fallback concept only, not designed in depth here.
+
+---
+
+## 2. Capacity Estimation
+
+State assumptions explicitly; the interviewer wants to hear your reasoning, not a memorized number.
+
+### 2.1 Base assumptions
+| Quantity | Assumption |
+|---|---|
+| Subscriber accounts | 300 million |
+| Devices per account | 1.7 average (phone + TV + tablet mix) |
+| Registered devices | **~500 million** |
+| Avg. notifications per user per day | 2 (mix of recs, releases, downloads, account) |
+| Daily notification volume | 300M × 2 = **~600M–1B/day** (using 800M as a working number) |
+
+### 2.2 Throughput
+- **Steady-state average**: 800,000,000 / 86,400 s ≈ **~9,300 notifications/sec**
+- **Peak burst scenario** — a flagship season drops, targeting 80M eligible/opted-in devices, delivered over a 20-minute window:
+  - 80,000,000 / 1,200 s ≈ **~67,000 notifications/sec peak**
+- **Design implication**: peak-to-average ratio is roughly **7×**. The system must be provisioned and rate-limited for the peak, not the average — and more importantly, the *external* push providers (APNs/FCM) enforce their own throttling, so peak absorption is as much about **pacing** as raw throughput. See Deep Dive 1.
+
+### 2.3 Storage
+| Store | Row estimate | Row size | Total |
+|---|---|---|---|
+| Device registry | 500M rows | ~500 bytes (device_id, user_id, token, platform, locale, status, timestamps) | **~250 GB** |
+| User preferences | 300M rows | ~300 bytes (flags map + quiet hours + locale) | **~90 GB** |
+| Segment index (device_ids bucketed by category+region) | Derived, ~1–2× device registry due to multi-category membership | — | **~500 GB–1 TB** |
+| Delivery log, 30-day retention | 800M/day × 30 = 24B rows × ~200 bytes | — | **~4.8 TB raw** (compresses well; time-series columnar storage recommended for the analytics copy) |
+
+### 2.4 Bandwidth
+- Avg. payload ~1 KB (title, body, deep link, image reference, metadata).
+- Peak egress to provider gateways: 67,000/sec × 1 KB ≈ **~67 MB/s**, trivially within modern network capacity — **the bottleneck is not bandwidth, it's the providers' per-app rate limits and connection concurrency**, which is why the deep dive focuses there rather than on raw throughput provisioning.
+
+### 2.5 Connections
+- APNs: HTTP/2 over persistent TLS connections; a small number of multiplexed connections per dispatcher node can carry very high request concurrency (thousands of in-flight streams per connection) — so **connection count is not the constraint, provider-side rate limiting is**.
+- FCM: supports multicast (batch) sends of up to 500 device tokens per API call — batching reduces the effective call count by ~500× versus per-device calls.
+
+---
+
+## 3. API Design
+
+```
+POST /v1/notifications/send            # transactional, single-user, near-real-time
+  { user_id, template_id, params, priority }
+
+POST /v1/campaigns                     # segment/broadcast campaign creation
+  { template_id, segment_query, scheduled_at, delivery_window_minutes }
+
+GET  /v1/campaigns/{id}/status         # delivery funnel: sent/delivered/opened counts
+
+POST /v1/devices/register              # device registers/updates push token
+  { user_id, device_id, platform, push_token, locale, timezone }
+
+POST /v1/preferences                   # user updates category opt-in/out, quiet hours
+  { user_id, category_flags, quiet_hours_start, quiet_hours_end }
+
+POST /v1/webhooks/delivery-receipt     # provider callback: delivered / opened / token-invalid
+```
+
+Internal producers (content-catalog, recs engine, billing, live-event scheduler) call the transactional or campaign endpoints — they never talk to APNs/FCM directly.
+
+---
+
+## 4. Data Model / Schema
+
+### 4.1 Device Registry (Cassandra / DynamoDB — partition key: `device_id`)
+```
+Device
+  device_id        PK
+  user_id          indexed (secondary index or GSI)
+  platform         ios | android | web | tv
+  push_token       opaque string, rotates periodically
+  app_version
+  locale, timezone
+  status           active | expired | invalid
+  last_active_at
+  created_at, updated_at
+```
+- **Write pattern**: high — token refreshes, app opens.
+- **Read pattern**: point read by device_id (transactional dispatch) and by user_id (fan-out to all of a user's devices).
+- **Token invalidation**: when a provider returns "token no longer valid" on a delivery attempt, the dispatcher writes back `status=invalid` — this table is the source of truth that keeps the segment index (below) clean.
+
+### 4.2 User Preferences (partition key: `user_id`)
+```
+UserPreferences
+  user_id                PK
+  category_flags         map<text, bool>   e.g. {new_release: true, recs: false, downloads: true, marketing: false}
+  quiet_hours_start       local time
+  quiet_hours_end         local time
+  timezone
+  updated_at
+```
+- Single-partition point read — this is what backs the **transactional path** directly, with a Redis write-through cache for hot users (active in last 24h) to shave point-read latency further.
+
+### 4.3 Segment Index (derived, NOT the canonical store — see Deep Dive 2)
+```
+SegmentIndex
+  segment_key       PK   e.g. "new_release#US#bucket_0042"
+  device_ids        set<text>, capped per bucket (~100K)
+  updated_at
+```
+- Populated via CDC off `UserPreferences` + `Device` — never written to directly by application code.
+- Bucketing exists specifically to avoid wide-partition problems at 10s of millions of members per raw segment key (see Deep Dive 2).
+
+### 4.4 Notification Template & Campaign
+```
+NotificationTemplate
+  template_id      PK
+  type
+  title, body, deep_link, image_ref
+  ttl_seconds
+  priority         high | normal
+
+Campaign
+  campaign_id      PK
+  template_id      FK
+  target_segment_query
+  scheduled_at
+  delivery_window_minutes
+  status           draft | scheduled | canary | ramping | completed | failed
+```
+
+### 4.5 Delivery Log (append-only, time-partitioned — Cassandra/wide-column or a columnar store for analytics)
+```
+DeliveryLog
+  notification_id   PK
+  device_id, user_id, campaign_id
+  status            queued | sent | delivered | failed | opened
+  attempt_count
+  provider_message_id
+  error_code        (nullable)
+  sent_at, delivered_at, opened_at
+```
+- Partitioned by `date + campaign_id` (or `date + shard`) to keep write hot-spots distributed and to make 30-day TTL cleanup a cheap partition-drop rather than row-by-row deletes.
+
+---
+
+## 5. High-Level Architecture
+
+```
+ Internal producers (catalog, recs, billing, live-event scheduler)
+              │
+      Notification / Campaign API  ◄── idempotency keys enforced here
+              │
+   Preference & Eligibility Filter  ── reads UserPreferences (opt-in, quiet hours, locale)
+              │
+       Fan-out / Targeting Service  ── reads SegmentIndex (bucketed), resolves device_id list
+              │
+        Kafka (partitioned by hash(device_id) or by region/shard)
+              │
+   ┌──────────┼───────────┬─────────────┐
+Dispatcher   Dispatcher  Dispatcher   Dispatcher
+ (APNs)       (FCM)      (Web Push)    (TV/other)
+   │            │             │             │
+   └── per-provider adaptive rate limiter (token bucket) ──┘
+              │
+     Retry w/ backoff  →  Dead Letter Queue (permanent failures, invalid tokens)
+              │
+      Delivery Log  →  Streaming analytics (funnel, CTR, provider error-rate dashboards)
+```
+
+**Why Kafka sits between fan-out and dispatch, specifically:** it decouples the *rate at which the fan-out service can resolve a segment* from the *rate at which providers can actually accept pushes*. Fan-out can burst-write 80M device_ids into Kafka quickly; dispatchers then pull at a sustainable, provider-safe rate. Kafka is the shock absorber for the entire burst problem.
+
+**Storage choices and why:**
+- **Cassandra/DynamoDB** for device registry & preferences: write-heavy, needs horizontal scale, and tunable/eventual consistency is an acceptable tradeoff (see Deep Dive 2).
+- **Kafka** as the fan-out → dispatch buffer: high write throughput, natural backpressure when consumers slow down, replay capability if a dispatcher fleet needs to be restarted mid-campaign.
+- **Redis** for hot-path preference/rate-limiter state: sub-millisecond reads for the transactional path and for live token-bucket state shared across dispatcher nodes.
+
+---
+
+## Deep Dive 1: Thundering Herd — Handling the 80M-Device Burst
+
+### 5.1 Why the naive approach breaks
+Resolving a segment into 80M device_ids and firing all pushes immediately fails in three independent places simultaneously:
+1. **Provider-side throttling** — APNs and FCM enforce their own per-app rate limits; exceeding them returns 429/503, and providers may temporarily penalize an app that consistently exceeds limits.
+2. **Your own infrastructure** — Kafka partitions and dispatcher fleets spike from ~9K/sec average to 67K/sec instantly, with no ramp-up to autoscale against.
+3. **A secondary thundering herd downstream** — 80M devices waking up simultaneously all hit the content-catalog/CDN for the new episode's metadata and artwork at the same instant the push arrives, which can take down systems that had nothing to do with notifications.
+
+### 5.2 Mitigation stack (in the order I'd actually implement them)
+
+**(a) Spread delivery over a window, with jitter — not an instant blast.**
+Shard the 80M target device_ids by `hash(device_id) % N`. Dispatch shards on a staggered schedule across the delivery window (e.g., 20 minutes), and add random jitter (±few seconds) within each shard's dispatch slot so the aggregate send-rate curve looks like a ramp/plateau, not a step function.
+
+```
+Pseudocode — staggered shard dispatch
+for shard in shards(campaign, N=200):
+    delay = (shard.index / N) * window_seconds + random_jitter(0, 5)
+    schedule(dispatch_shard, at=now() + delay, args=shard)
+```
+
+**(b) Respect provider limits explicitly via an adaptive token bucket, per provider, per region.**
+```
+class AdaptiveTokenBucket:
+    capacity: int          # current safe rate, starts conservative
+    tokens: float
+    refill_rate: float     # tokens/sec
+
+    def try_acquire():
+        refill()
+        if tokens >= 1:
+            tokens -= 1
+            return True
+        return False        # caller backs off, message stays in Kafka
+
+    def on_provider_response(status):
+        if status in (429, 503):
+            capacity *= 0.5      # circuit-breaker-style shrink
+        elif consecutive_success > threshold:
+            capacity *= 1.05     # slow ramp back up
+```
+When the bucket shrinks, dispatchers simply pull less from Kafka — messages queue there safely rather than being dropped, and the queue itself becomes visible backpressure that ops/autoscaling can react to.
+
+**(c) Prefer provider-native topic/multicast delivery when personalization isn't required.**
+- FCM: multicast up to 500 tokens/call, or topic subscriptions where FCM itself fans out to subscribed devices.
+- APNs: no native topic broadcast, but HTTP/2 multiplexing lets one connection carry very high concurrent request volume.
+- Reserve **per-device dispatch** for cases that need personalization (localized title/artwork, per-user deep link) — for a pure "season is live" ping with no personalization, provider-side fan-out offloads the single hardest part of this problem entirely.
+
+**(d) Canary before full ramp.**
+Send to 1% of the resolved segment first. Watch delivery error rate and provider throttling signals (429 rate, APNs error codes) for ~60 seconds. Only then ramp shard-by-shard to 100%. This catches a malformed template or a bad deep link before burning through the provider rate budget on a broken campaign.
+
+**(e) Protect the downstream systems, not just the notification pipeline.**
+Pre-warm CDN/cache for the new content's metadata and artwork *before* the push window opens. The notification system succeeding at delivering 80M pushes is meaningless if the catalog service falls over five seconds later from the resulting traffic — this is the point most candidates miss, and the one most worth raising proactively: think of the push as triggering a downstream load spike, not as the end of the story.
+
+### 5.3 What "good" looks like operationally
+A dashboard during a major campaign should show: current effective send rate vs. provider-safe ceiling, 429/503 rate per provider trending toward zero, Kafka consumer lag per shard, and downstream catalog-service latency — all on one screen, so an on-call engineer can pause a campaign (a first-class action, not just "let it run") if any of these degrade.
+
+---
+
+## Deep Dive 2: Preference & Segment Data Model at Scale
+
+### 5.4 The core tension
+- **Transactional path** ("tell this one user their download is ready") needs a fast point read — sub-10ms, single partition.
+- **Fan-out path** ("give me every device_id opted into new_release, region=US") needs to avoid scanning 300M user rows per campaign.
+
+One data model, one access pattern optimized, cannot cheaply serve both — so the design deliberately splits **source of truth** from **read-optimized derived view**.
+
+### 5.5 Canonical store: `UserPreferences`, partition key = `user_id`
+A single-partition point read. Backs the transactional path directly. Fronted by Redis (write-through cache) for the ~10–20% of users active in the last 24 hours, since that's where transactional traffic concentrates.
+
+### 5.6 Derived segment index, populated via CDC
+Preference *writes* to the canonical store stream through a change-data-capture pipeline (Kafka Connect / DynamoDB Streams / Cassandra CDC) into a **separate segment index** keyed by `(category, region)`. The fan-out service queries only this index at campaign time — O(segment size), never O(all users).
+
+```
+CDC stream on UserPreferences write
+  → transform: which segment_keys does this user now belong to / leave?
+  → upsert / remove device_ids in SegmentIndex partitions accordingly
+```
+
+### 5.7 The wide-partition problem, and the fix
+A segment key like `new_release#US` can hold tens of millions of device_ids on its own — a single oversized partition, which breaks per-partition size/throughput limits in Cassandra-style stores and creates a hot-partition bottleneck exactly when a campaign needs to read it fastest.
+
+**Fix — sub-bucket the segment key:**
+```
+new_release#US#bucket_0000
+new_release#US#bucket_0001
+...
+new_release#US#bucket_0999
+```
+Each bucket capped at roughly 100K device_ids (bucket count chosen so max bucket size stays well under partition size limits, with headroom for segment growth). Assignment to a bucket is `hash(device_id) % bucket_count` — deterministic, so CDC updates know exactly which bucket to touch without a lookup. The fan-out service iterates buckets **in parallel**, which is also precisely what feeds the staggered-shard dispatch in Deep Dive 1 — the same partitioning number can double as the dispatch shard count, so the two deep dives compose naturally into one coherent design rather than being solved independently.
+
+### 5.8 Consistency tradeoff — say this explicitly in the interview
+Last-write-wins with a timestamp is deliberately chosen over strong consistency here. A few seconds of staleness between "user disables new-release pings" and the segment index reflecting that is an acceptable cost for a best-effort notification system — and paying for strong consistency (e.g., synchronous dual-write with quorum reads) would add real latency and operational complexity for a guarantee the product doesn't need. Interviewers are listening for whether you *default* to strong consistency out of habit, or reason explicitly about what the data actually requires — this is one of the clearest places to demonstrate that judgment.
+
+### 5.9 Keeping the index clean: token invalidation feedback loop
+When a dispatcher gets a "token invalid" response from a provider, it doesn't just drop the message — it writes `status=invalid` back to the `Device` table, which flows through the same CDC pipeline and removes that device_id from every `SegmentIndex` bucket it belonged to. Without this feedback loop, segment indexes silently accumulate dead device_ids over months, inflating campaign cost and provider rate-budget usage on sends that can never succeed.
+
+---
+
+## Deep Dive 3: Reliability & Failure Scenarios
+
+| Failure | Detection | Mitigation |
+|---|---|---|
+| APNs (or FCM) fully down | Circuit breaker sees error rate spike / connection failures | Adaptive token bucket for that provider drops to near-zero; messages queue in Kafka (bounded by TTL) rather than being dropped; **other providers' dispatchers are entirely separate consumer groups**, so Android/web delivery is unaffected — no shared fate. |
+| Provider partially degraded (elevated latency, no errors) | Latency percentile tracking per provider, not just error rate | Token bucket shrinks proactively on latency SLO breach, not just on explicit 429/503 — catches "gray failure" before it becomes a hard failure. |
+| Dispatcher fleet crash mid-campaign | Kafka consumer group rebalance; consumer lag alert | At-least-once semantics: in-flight messages are re-delivered to a healthy consumer; `notification_id` used as an idempotency key downstream so a user doesn't get a true duplicate even if the same message is dispatched twice. |
+| Segment index CDC pipeline falls behind during a burst (preference writes spike alongside the campaign) | Consumer lag metric on the CDC topic | Fan-out reads accept slightly stale segment data (by design, per Deep Dive 2) rather than blocking; lag alert pages on-call if staleness exceeds a defined SLA (e.g., >5 min) rather than failing the campaign. |
+| Malformed/broken campaign template | Canary phase (Deep Dive 1) catches this before full ramp | Canary error-rate threshold auto-pauses the campaign; on-call gets paged with the canary's specific error signature rather than discovering it after 80M sends. |
+| Region-level outage (regional Kafka cluster or dispatcher fleet down) | Regional health check / control-plane heartbeat | Campaigns targeting the affected region pause automatically; other regions continue unaffected, since fan-out and dispatch are region-sharded, not globally coupled. |
+| Duplicate delivery due to retry | N/A — expected under at-least-once | `notification_id` idempotency key deduplicates at the client SDK layer (or dispatcher checks DeliveryLog for an existing `sent` status before resending on retry). |
+
+**Retry policy for transient provider errors (429/503/network timeout):** exponential backoff with jitter, capped attempts (e.g., 5), then routed to a dead-letter queue. DLQ entries are inspected by an automated job: token-invalid errors update the `Device` table (see 5.9); genuinely transient failures that exhausted retries get one final delayed retry after a longer cooldown; anything else is logged for manual/product review rather than retried indefinitely.
+
+---
+
+## Deep Dive 4: Observability
+
+**Delivery funnel, per campaign, updated near-real-time:** queued → sent → delivered → opened counts, streamed from the DeliveryLog into a time-series/analytics store (e.g., via the same Kafka backbone, consumed into a columnar analytics DB). This is what product teams look at to judge campaign effectiveness (CTR) and what on-call looks at to judge system health (delivered/sent ratio dropping is often the earliest signal of a provider problem).
+
+**Key operational metrics:**
+- Per-provider: send rate, 429/503 rate, p50/p99 latency.
+- Kafka: consumer lag per shard/partition (leading indicator of dispatcher fleet falling behind).
+- CDC pipeline: lag between a preference write and its reflection in SegmentIndex.
+- DLQ depth and top error codes (token-invalid rate spiking can indicate an app-side bug pushing bad tokens).
+
+**Alerting philosophy:** alert on *leading* indicators (Kafka lag, 429 rate trending up) rather than only *lagging* indicators (delivered/sent ratio, which by the time it's bad may mean a large fraction of a campaign already failed).
+
+---
+
+## Deep Dive 5: Security & Privacy
+
+- **Push tokens are opaque, rotate periodically**, and are treated as sensitive — access to the Device table is scoped to the notification system's own services, not broadly readable.
+- **Opt-out is enforced at the Preference & Eligibility Filter stage**, before fan-out — never as a post-hoc filter after dispatch, so an opt-out is honored even for in-flight campaign windows.
+- **Regional data residency**: device/preference records for EU users can be pinned to EU-region storage if required, with the segment index and dispatch pipeline respecting the same regional boundary.
+- **Right-to-be-forgotten**: deleting a user cascades — canonical `Device`/`UserPreferences` rows deleted, which flows through the same CDC pipeline used for token invalidation (5.9) to remove the user from all `SegmentIndex` buckets, rather than requiring a separate deletion pathway.
+
+---
+
+## 6. Trade-off Summary (for quick recall in the interview)
+
+| Decision | Chosen approach | Rejected alternative | Why |
+|---|---|---|---|
+| Preference store consistency | Eventually consistent, LWW | Strongly consistent, quorum writes | A few seconds of staleness is an acceptable cost for a best-effort system; strong consistency adds latency/complexity the product doesn't need |
+| Segment resolution | Precomputed, CDC-derived, bucketed index | Live query over canonical preference store | Avoids O(all users) scans per campaign; canonical store stays optimized for point reads |
+| Burst absorption | Kafka buffer + adaptive per-provider token bucket + staggered shard dispatch | Direct synchronous fan-out to providers | Providers enforce hard rate limits; direct fan-out either gets throttled/rejected or risks provider penalties |
+| Broad, non-personalized sends | Provider-native topic/multicast | Per-device dispatch for everything | Offloads fan-out to the provider entirely when personalization isn't needed |
+| Delivery semantics | At-least-once + idempotency key | Exactly-once | Exactly-once is expensive to guarantee end-to-end across external providers you don't control; idempotency key gets the same user-facing result cheaper |
+| Provider isolation | Fully separate consumer groups/dispatcher fleets per provider | Shared dispatch pool across providers | Prevents one provider's outage from degrading delivery on unaffected platforms |
+
+---
+
+## 7. What to Say Out Loud (Interview Delivery Notes)
+
+- Open by **scoping the problem** (streaming platform, known categories, predictable-but-large bursts) before drawing any boxes.
+- State capacity assumptions **explicitly** and derive numbers live rather than reciting them — the peak-vs-average ratio (7×) is the single number that justifies most of the architecture that follows.
+- When asked to "dig deeper," go to **failure modes and data model tradeoffs first** — that's consistently where Staff-level signal is differentiated from a correct-but-shallow design.
+- Volunteer the **downstream blast-radius point** (pre-warming the CDN/catalog service before a mass push) without being asked — it shows systems thinking beyond the component you were literally asked to design.
+- If time allows, close by naming what you'd cut under a tighter timeline (e.g., "the segment sub-bucketing is the first thing I'd defer if this were a smaller scale") — shows you understand these are engineering tradeoffs, not requirements handed down from nowhere.
