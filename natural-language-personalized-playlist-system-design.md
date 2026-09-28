@@ -202,6 +202,11 @@ playlist.
 
 # 4. High-Level Architecture
 
+
+![Natural-Language=Personalised-Playlist - High Level Design](./images/playlist-generator-hld.png)
+
+> The diagram above is the original design used as the basis for the detailed discussion below.
+
 ``` text
                              USER
                               |
